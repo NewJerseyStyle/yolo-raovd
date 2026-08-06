@@ -66,7 +66,7 @@ yolo-raovd --help
     +-- references_text.json
 ```
 
-## Quick run (MVP)
+## Quick run
 
 1) Build text references index
 
@@ -187,15 +187,6 @@ The query format can be:
   - `mean`
   - `lse`
 
-## Active model stack
-
-The implementation now uses:
-
-- `SimpleTextEncoder`: CLIP text encoder (text query branch)
-- `SimpleCLIPImageEncoder`: CLIP image encoder (to align with CLIP text space)
-- `SimpleImageEncoder`: DINOv3 ViT16+/vit16plus backbone (region embedding + image-query branch)
-- `RegionProposalGenerator`: lightweight proposal generator (replace with a YOLO head for production)
-
 ## Runtime dependencies for model loading
 
 ```bash
@@ -204,9 +195,3 @@ pip install torch torchvision transformers
 
 - If your workflow uses `--query-image`, DINOv3 is used for image embedding.
 - If your workflow uses `--query`, CLIP image embeddings are used for region matching.
-
-
-
-
-
-
