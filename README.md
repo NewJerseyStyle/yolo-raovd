@@ -34,9 +34,9 @@ huggingface-cli login
 
 Then open the DINO model pages and agree to the license terms:
 
-- https://huggingface.co/facebook/dinov3-vit16plus
-- https://huggingface.co/facebook/dinov3-vitl16
-- https://huggingface.co/facebook/dinov2-vit-large (fallback)
+- https://huggingface.co/facebook/dinov3-vits16plus-pretrain-lvd1689m
+- https://huggingface.co/facebook/dinov3-vit7b16-pretrain-lvd1689m
+- https://huggingface.co/facebook/dinov2-base (fallback)
 
 After installation:
 
