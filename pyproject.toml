@@ -1,0 +1,28 @@
+﻿[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "yolo-raovd"
+version = "0.1.0"
+description = "YOLO-RAOVD: zero-shot open-vocabulary object detection using region proposals + retrieval"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+  {name = "YOLO-RAOVD Contributors"}
+]
+dependencies = [
+  "numpy",
+  "Pillow",
+  "faiss-cpu",
+  "torch",
+  "torchvision",
+  "transformers"
+]
+
+[project.scripts]
+yolo-raovd = "yolo_raovd.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["yolo_raovd"]

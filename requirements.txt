@@ -1,0 +1,6 @@
+﻿numpy
+Pillow
+faiss-cpu
+torch
+torchvision
+transformers

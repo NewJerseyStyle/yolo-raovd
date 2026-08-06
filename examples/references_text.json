@@ -1,0 +1,4 @@
+[
+  {"id": "cls_cup_red", "label": "red_cup", "text": "red cup", "modality": "text"},
+  {"id": "cls_bottle_blue", "label": "blue_bottle", "text": "blue water bottle", "modality": "text"}
+]
