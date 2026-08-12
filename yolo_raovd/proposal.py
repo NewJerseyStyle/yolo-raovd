@@ -3,32 +3,34 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple
 
+import numpy as np
+
 
 @dataclass
-class RegionProposalGenerator:
-    """Grid-style proposal fallback before YOLO backbone is plugged in."""
+class YOLOProposalGenerator:
+    """YOLO-backed region proposal generator using ultralytics."""
 
-    def propose(self, width: int, height: int, max_boxes: int = 200) -> List[Tuple[List[float], float]]:
-        proposals = []
-        scales = [0.28, 0.2, 0.12]
-        strides = []
-        for scale in scales:
-            box_w = max(int(width * scale), 24)
-            box_h = max(int(height * scale), 24)
-            stride_w = max(int(box_w * 0.7), 1)
-            stride_h = max(int(box_h * 0.7), 1)
-            strides.append((box_w, box_h, stride_w, stride_h))
+    model_path: str = "yolo11n.pt"
+    conf: float = 0.25
+    iou: float = 0.45
+    max_det: int = 300
 
-        for idx, (box_w, box_h, stride_w, stride_h) in enumerate(strides):
-            for y in range(0, max(height - box_h + 1, 1), stride_h):
-                for x in range(0, max(width - box_w + 1, 1), stride_w):
-                    x1, y1 = float(x), float(y)
-                    x2, y2 = float(min(x + box_w, width - 1)), float(min(y + box_h, height - 1))
-                    if x2 <= x1 or y2 <= y1:
-                        continue
-                    score = 0.35 + 0.15 * (1.0 - idx * 0.2)
-                    proposals.append(([x1, y1, x2, y2], float(min(max(score, 0.05), 0.95))))
-                    if len(proposals) >= max_boxes:
-                        return proposals
+    def __post_init__(self) -> None:
+        from ultralytics import YOLO
+
+        self._model = YOLO(self.model_path)
+
+    def propose(self, image: np.ndarray, max_boxes: int = 200) -> List[Tuple[List[float], float]]:
+        results = self._model(image, conf=self.conf, iou=self.iou, max_det=self.max_det, verbose=False)
+        proposals: List[Tuple[List[float], float]] = []
+        for r in results:
+            if r.boxes is None or r.boxes.xyxy is None:
+                continue
+            boxes = r.boxes.xyxy.cpu().numpy()
+            scores = r.boxes.conf.cpu().numpy()
+            for box, score in zip(boxes, scores):
+                x1, y1, x2, y2 = map(float, box)
+                proposals.append(([x1, y1, x2, y2], float(score)))
+                if len(proposals) >= max_boxes:
+                    return proposals
         return proposals
-

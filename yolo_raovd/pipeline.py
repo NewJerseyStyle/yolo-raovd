@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 from dataclasses import dataclass
@@ -10,7 +10,7 @@ import numpy as np
 
 from .confidence import aggregate_scores, compute_confidence, nms
 from .encoding import SimpleCLIPImageEncoder, SimpleImageEncoder, SimpleTextEncoder
-from .proposal import RegionProposalGenerator
+from .proposal import YOLOProposalGenerator
 from .retrieval import ReferenceIndex
 from .types import Detection
 
@@ -26,6 +26,10 @@ class YoloRaovdConfig:
     nms_iou: float = 0.5
     support_threshold: float = 0.0
     max_proposals: int = 180
+    yolo_model_path: str = "yolo11n.pt"
+    yolo_conf: float = 0.25
+    yolo_iou: float = 0.45
+    yolo_max_det: int = 300
 
 
 class YoloRaovdDetector:
@@ -44,7 +48,12 @@ class YoloRaovdDetector:
         self.text_index = text_index
         self.image_index = image_index
         self.config = config or YoloRaovdConfig()
-        self.proposer = RegionProposalGenerator()
+        self.proposer = YOLOProposalGenerator(
+            model_path=self.config.yolo_model_path,
+            conf=self.config.yolo_conf,
+            iou=self.config.yolo_iou,
+            max_det=self.config.yolo_max_det,
+        )
 
     def _load_image_array(self, image_path: str) -> np.ndarray:
         from PIL import Image
@@ -62,6 +71,100 @@ class YoloRaovdDetector:
         y2 = max(y1 + 1, min(h, y2))
         return image[y1:y2, x1:x2]
 
+    def _resolve_query_labels(self, query: str, top_k: int, min_ratio: float = 0.6) -> set[str]:
+        """Open-vocabulary matching keeps only the query and semantically close labels.
+
+        In OVD systems, text queries are treated as class prototypes and region features are
+        matched against that prompt-conditioned set rather than against the full reference bank.
+        """
+        q = str(query).strip()
+        if not q:
+            return set()
+        if self.text_index is None or self.text_index.vectors.size == 0:
+            return {q}
+
+        query_vector = self.text_encoder.encode(q)
+        query_scores, query_payloads = self.text_index.search(query_vector, top_k=top_k, use_faiss=False)
+        candidates: Dict[str, float] = {}
+        for s, payload in zip(query_scores, query_payloads):
+            label = str(payload.get("label", q) or "").strip()
+            if not label:
+                continue
+            candidates[label] = max(candidates.get(label, -1e9), float(s))
+
+        if not candidates:
+            return {q}
+
+        best_score = max(candidates.values())
+        threshold = max(0.35, min_ratio * best_score)
+        kept = {label for label, score in candidates.items() if label.lower() == q.lower() or score >= threshold}
+        if not kept:
+            kept = {q}
+        return kept
+
+    def retrieve_candidates(
+        self,
+        query: str,
+        *,
+        mode: str = "text",
+        query_image: Optional[str] = None,
+        top_k: Optional[int] = None,
+        metadata_filter: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+        top_k = top_k if top_k is not None else self.config.top_k
+        text_index = self.text_index
+        image_index = self.image_index
+
+        if mode == "text":
+            if text_index is None or text_index.vectors.size == 0:
+                return np.empty((0,), dtype=np.float32), []
+            vector = self.text_encoder.encode(query)
+            return text_index.search(vector, top_k=top_k, use_faiss=False, metadata_filter=metadata_filter, modality="text")
+
+        if mode == "image":
+            if image_index is None or image_index.vectors.size == 0:
+                return np.empty((0,), dtype=np.float32), []
+            if query_image is None:
+                raise ValueError("query_image is required for image mode")
+            vector = self.image_encoder.encode_image(query_image)
+            return image_index.search(vector, top_k=top_k, use_faiss=False, metadata_filter=metadata_filter, modality="image")
+
+        if mode == "hybrid":
+            results: List[Tuple[float, Dict[str, Any]]] = []
+            if text_index is not None and text_index.vectors.size > 0:
+                text_vector = self.text_encoder.encode(query)
+                text_scores, text_payloads = text_index.search(
+                    text_vector,
+                    top_k=top_k,
+                    use_faiss=False,
+                    metadata_filter=metadata_filter,
+                    modality="text",
+                )
+                for s, p in zip(text_scores, text_payloads):
+                    results.append((float(s), p))
+            if image_index is not None and image_index.vectors.size > 0 and query_image is not None:
+                image_vector = self.image_encoder.encode_image(query_image)
+                image_scores, image_payloads = image_index.search(
+                    image_vector,
+                    top_k=top_k,
+                    use_faiss=False,
+                    metadata_filter=metadata_filter,
+                    modality="image",
+                )
+                for s, p in zip(image_scores, image_payloads):
+                    results.append((float(s), p))
+            if not results:
+                return np.empty((0,), dtype=np.float32), []
+            merged = {}
+            for score, payload in results:
+                key = str(payload.get("id") or payload.get("label") or repr(payload))
+                merged[key] = {**payload, "_score": max(float(merged.get(key, {}).get("_score", -1e9)), score)}
+            ordered = sorted(merged.values(), key=lambda x: float(x.get("_score", 0.0)), reverse=True)[:top_k]
+            scores = np.asarray([float(item.get("_score", 0.0)) for item in ordered], dtype=np.float32)
+            return scores, ordered
+
+        raise ValueError(f"unsupported retrieval mode: {mode}")
+
     def detect_with_text_queries(
         self,
         image_path: str,
@@ -74,7 +177,7 @@ class YoloRaovdDetector:
             raise ValueError("text index is empty, run index first")
         image = self._load_image_array(image_path)
         h, w = image.shape[:2]
-        proposals = self.proposer.propose(w, h, self.config.max_proposals)
+        proposals = self.proposer.propose(image, self.config.max_proposals)
         top_k = top_k if top_k is not None else self.config.top_k
         score_threshold = score_threshold if score_threshold is not None else self.config.score_threshold
         nms_iou = nms_iou if nms_iou is not None else self.config.nms_iou
@@ -84,13 +187,19 @@ class YoloRaovdDetector:
             q = q.strip()
             if not q:
                 continue
-            query_vector = self.text_encoder.encode(q)
-            q_scores, q_payloads = self.text_index.search(query_vector, top_k=top_k, use_faiss=False)
-            query_labels = [p.get("label", q) for p in q_payloads]
+            query_labels = self._resolve_query_labels(q, top_k=top_k)
             query_label_boost: Dict[str, float] = {}
+            query_vector = self.text_encoder.encode(q)
+            q_scores, q_payloads = self.text_index.search(
+                query_vector,
+                top_k=top_k,
+                use_faiss=False,
+                modality="text",
+            )
             for s, p in zip(q_scores, q_payloads):
                 label = p.get("label", q)
-                query_label_boost[label] = max(query_label_boost.get(label, -1e9), float(s))
+                if label in query_labels:
+                    query_label_boost[label] = max(query_label_boost.get(label, -1e9), float(s))
 
             for box, obj_score in proposals:
                 region = self._crop_region(image, box)
@@ -100,9 +209,8 @@ class YoloRaovdDetector:
                 topk_meta: Dict[str, List[Dict[str, Any]]] = {}
                 for s, p in zip(scores, payloads):
                     label = p.get("label", q)
-                    if query_labels:
-                        if label not in query_labels:
-                            continue
+                    if query_labels and label not in query_labels:
+                        continue
                     by_label.setdefault(label, []).append(float(s))
                     topk_meta.setdefault(label, []).append({
                         "ref_id": p.get("id"),
@@ -173,7 +281,7 @@ class YoloRaovdDetector:
             raise ValueError("image index is empty, run index with image references first")
         image = self._load_image_array(image_path)
         h, w = image.shape[:2]
-        proposals = self.proposer.propose(w, h, self.config.max_proposals)
+        proposals = self.proposer.propose(image, self.config.max_proposals)
         top_k = top_k if top_k is not None else self.config.top_k
         score_threshold = score_threshold if score_threshold is not None else self.config.score_threshold
         nms_iou = nms_iou if nms_iou is not None else self.config.nms_iou
