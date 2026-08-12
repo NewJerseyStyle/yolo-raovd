@@ -19,7 +19,8 @@ dependencies = [
   "torch",
   "torchvision",
   "transformers",
-  "ultralytics"
+  "ultralytics",
+  "chromadb"
 ]
 
 [project.scripts]
