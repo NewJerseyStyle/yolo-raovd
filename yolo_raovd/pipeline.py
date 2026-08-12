@@ -11,7 +11,7 @@ import numpy as np
 from .confidence import aggregate_scores, compute_confidence, nms
 from .encoding import SimpleCLIPImageEncoder, SimpleImageEncoder, SimpleTextEncoder
 from .proposal import YOLOProposalGenerator
-from .retrieval import ReferenceIndex
+from .retrieval import ChromaReferenceStore, ReferenceIndex, build_chroma_from_references
 from .types import Detection
 
 
@@ -30,6 +30,8 @@ class YoloRaovdConfig:
     yolo_conf: float = 0.25
     yolo_iou: float = 0.45
     yolo_max_det: int = 300
+    chroma_persist_directory: Optional[str] = None
+    chroma_collection_name: str = "references"
 
 
 class YoloRaovdDetector:
@@ -40,6 +42,7 @@ class YoloRaovdDetector:
         text_image_encoder: Optional[SimpleCLIPImageEncoder] = None,
         text_index: Optional[ReferenceIndex] = None,
         image_index: Optional[ReferenceIndex] = None,
+        chroma_store: Optional[ChromaReferenceStore] = None,
         config: Optional[YoloRaovdConfig] = None,
     ) -> None:
         self.text_encoder = text_encoder or SimpleTextEncoder()
@@ -47,6 +50,7 @@ class YoloRaovdDetector:
         self.text_image_encoder = text_image_encoder or SimpleCLIPImageEncoder()
         self.text_index = text_index
         self.image_index = image_index
+        self.chroma_store = chroma_store
         self.config = config or YoloRaovdConfig()
         self.proposer = YOLOProposalGenerator(
             model_path=self.config.yolo_model_path,
@@ -80,13 +84,16 @@ class YoloRaovdDetector:
         q = str(query).strip()
         if not q:
             return set()
-        if self.text_index is None or self.text_index.vectors.size == 0:
+        if self.chroma_store is None and (self.text_index is None or self.text_index.vectors.size == 0):
             return {q}
 
         query_vector = self.text_encoder.encode(q)
-        query_scores, query_payloads = self.text_index.search(query_vector, top_k=top_k, use_faiss=False)
+        if self.chroma_store is not None:
+            q_scores, q_payloads = self.chroma_store.search(query_vector, top_k=top_k, modality="text")
+        else:
+            q_scores, q_payloads = self.text_index.search(query_vector, top_k=top_k, use_faiss=False)
         candidates: Dict[str, float] = {}
-        for s, payload in zip(query_scores, query_payloads):
+        for s, payload in zip(q_scores, q_payloads):
             label = str(payload.get("label", q) or "").strip()
             if not label:
                 continue
@@ -102,6 +109,48 @@ class YoloRaovdDetector:
             kept = {q}
         return kept
 
+    def _search_text(self, query: np.ndarray, top_k: int) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+        if self.chroma_store is not None:
+            return self.chroma_store.search(query, top_k=top_k, modality="text")
+        if self.text_index is None or self.text_index.vectors.size == 0:
+            return np.empty((0,), dtype=np.float32), []
+        return self.text_index.search(query, top_k=top_k, use_faiss=False, modality="text")
+
+    def _search_image(self, query: np.ndarray, top_k: int) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+        if self.chroma_store is not None:
+            return self.chroma_store.search(query, top_k=top_k, modality="image")
+        if self.image_index is None or self.image_index.vectors.size == 0:
+            return np.empty((0,), dtype=np.float32), []
+        return self.image_index.search(query, top_k=top_k, use_faiss=False, modality="image")
+
+    def _search_batch_text(self, queries: np.ndarray, top_k: int) -> Tuple[np.ndarray, List[List[Dict[str, Any]]]]:
+        if self.chroma_store is not None:
+            return self.chroma_store.search_batch(queries, top_k=top_k, modality="text")
+        return self._search_batch_fallback(queries, top_k, self.text_index)
+
+    def _search_batch_image(self, queries: np.ndarray, top_k: int) -> Tuple[np.ndarray, List[List[Dict[str, Any]]]]:
+        if self.chroma_store is not None:
+            return self.chroma_store.search_batch(queries, top_k=top_k, modality="image")
+        return self._search_batch_fallback(queries, top_k, self.image_index)
+
+    def _search_batch_fallback(
+        self,
+        queries: np.ndarray,
+        top_k: int,
+        index: Optional[ReferenceIndex],
+    ) -> Tuple[np.ndarray, List[List[Dict[str, Any]]]]:
+        if index is None or index.vectors.size == 0:
+            n = int(queries.shape[0]) if queries.ndim > 1 else 1
+            return np.empty((0, 0), dtype=np.float32), [[] for _ in range(n)]
+        all_scores: List[np.ndarray] = []
+        all_payloads: List[List[Dict[str, Any]]] = []
+        qs = queries if queries.ndim > 1 else queries[None, :]
+        for i in range(int(qs.shape[0])):
+            scores, payloads = index.search(qs[i], top_k=top_k, use_faiss=False)
+            all_scores.append(scores)
+            all_payloads.append(payloads)
+        return np.asarray(all_scores, dtype=np.float32), all_payloads
+
     def retrieve_candidates(
         self,
         query: str,
@@ -112,45 +161,26 @@ class YoloRaovdDetector:
         metadata_filter: Optional[Dict[str, Any]] = None,
     ) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
         top_k = top_k if top_k is not None else self.config.top_k
-        text_index = self.text_index
-        image_index = self.image_index
 
         if mode == "text":
-            if text_index is None or text_index.vectors.size == 0:
-                return np.empty((0,), dtype=np.float32), []
             vector = self.text_encoder.encode(query)
-            return text_index.search(vector, top_k=top_k, use_faiss=False, metadata_filter=metadata_filter, modality="text")
+            return self._search_text(vector, top_k)
 
         if mode == "image":
-            if image_index is None or image_index.vectors.size == 0:
-                return np.empty((0,), dtype=np.float32), []
             if query_image is None:
                 raise ValueError("query_image is required for image mode")
             vector = self.image_encoder.encode_image(query_image)
-            return image_index.search(vector, top_k=top_k, use_faiss=False, metadata_filter=metadata_filter, modality="image")
+            return self._search_image(vector, top_k)
 
         if mode == "hybrid":
             results: List[Tuple[float, Dict[str, Any]]] = []
-            if text_index is not None and text_index.vectors.size > 0:
-                text_vector = self.text_encoder.encode(query)
-                text_scores, text_payloads = text_index.search(
-                    text_vector,
-                    top_k=top_k,
-                    use_faiss=False,
-                    metadata_filter=metadata_filter,
-                    modality="text",
-                )
-                for s, p in zip(text_scores, text_payloads):
-                    results.append((float(s), p))
-            if image_index is not None and image_index.vectors.size > 0 and query_image is not None:
+            text_vector = self.text_encoder.encode(query)
+            text_scores, text_payloads = self._search_text(text_vector, top_k)
+            for s, p in zip(text_scores, text_payloads):
+                results.append((float(s), p))
+            if query_image is not None:
                 image_vector = self.image_encoder.encode_image(query_image)
-                image_scores, image_payloads = image_index.search(
-                    image_vector,
-                    top_k=top_k,
-                    use_faiss=False,
-                    metadata_filter=metadata_filter,
-                    modality="image",
-                )
+                image_scores, image_payloads = self._search_image(image_vector, top_k)
                 for s, p in zip(image_scores, image_payloads):
                     results.append((float(s), p))
             if not results:
@@ -190,21 +220,26 @@ class YoloRaovdDetector:
             query_labels = self._resolve_query_labels(q, top_k=top_k)
             query_label_boost: Dict[str, float] = {}
             query_vector = self.text_encoder.encode(q)
-            q_scores, q_payloads = self.text_index.search(
-                query_vector,
-                top_k=top_k,
-                use_faiss=False,
-                modality="text",
-            )
+            q_scores, q_payloads = self._search_text(query_vector, top_k)
             for s, p in zip(q_scores, q_payloads):
                 label = p.get("label", q)
                 if label in query_labels:
                     query_label_boost[label] = max(query_label_boost.get(label, -1e9), float(s))
 
-            for box, obj_score in proposals:
-                region = self._crop_region(image, box)
-                region_vector = self.text_image_encoder.encode(region)
-                scores, payloads = self.text_index.search(region_vector, top_k=top_k)
+            if self.chroma_store is not None and proposals:
+                region_vectors = np.stack([self.text_image_encoder.encode(self._crop_region(image, box)) for box, _ in proposals])
+                all_scores, all_payloads = self._search_batch_text(region_vectors, top_k)
+            else:
+                all_scores, all_payloads = None, None
+
+            for idx, (box, obj_score) in enumerate(proposals):
+                if all_scores is not None:
+                    scores = all_scores[idx] if idx < len(all_scores) else np.empty((0,), dtype=np.float32)
+                    payloads = all_payloads[idx] if idx < len(all_payloads) else []
+                else:
+                    region = self._crop_region(image, box)
+                    region_vector = self.text_image_encoder.encode(region)
+                    scores, payloads = self.text_index.search(region_vector, top_k=top_k)
                 by_label: Dict[str, List[float]] = {}
                 topk_meta: Dict[str, List[Dict[str, Any]]] = {}
                 for s, p in zip(scores, payloads):
@@ -297,7 +332,7 @@ class YoloRaovdDetector:
             if not q:
                 continue
             query_vector = self.image_encoder.encode_image(q)
-            q_scores, q_payloads = self.image_index.search(query_vector, top_k=top_k, use_faiss=False)
+            q_scores, q_payloads = self._search_image(query_vector, top_k)
             for s, p in zip(q_scores, q_payloads):
                 label = p.get("label")
                 if not label:
@@ -337,11 +372,21 @@ class YoloRaovdDetector:
         if not query_label_boost:
             return []
 
+        if self.chroma_store is not None and proposals:
+            region_vectors = np.stack([self.image_encoder.encode(self._crop_region(image, box)) for box, _ in proposals])
+            all_scores, all_payloads = self._search_batch_image(region_vectors, top_k)
+        else:
+            all_scores, all_payloads = None, None
+
         results: List[Detection] = []
-        for box, obj_score in proposals:
-            region = self._crop_region(image, box)
-            region_vector = self.image_encoder.encode(region)
-            scores, payloads = self.image_index.search(region_vector, top_k=top_k)
+        for idx, (box, obj_score) in enumerate(proposals):
+            if all_scores is not None:
+                scores = all_scores[idx] if idx < len(all_scores) else np.empty((0,), dtype=np.float32)
+                payloads = all_payloads[idx] if idx < len(all_payloads) else []
+            else:
+                region = self._crop_region(image, box)
+                region_vector = self.image_encoder.encode(region)
+                scores, payloads = self.image_index.search(region_vector, top_k=top_k)
             by_label: Dict[str, List[float]] = {}
             topk_meta: Dict[str, List[Dict[str, Any]]] = {}
             for s, p in zip(scores, payloads):
@@ -445,7 +490,9 @@ def build_reference_indexes(
     out_dir: str,
     text_encoder: Optional[SimpleTextEncoder] = None,
     image_encoder: Optional[SimpleImageEncoder] = None,
-) -> Dict[str, str]:
+    chroma_dir: Optional[str] = None,
+    chroma_collection_name: str = "references",
+) -> Dict[str, Any]:
     text_encoder = text_encoder or SimpleTextEncoder()
     image_encoder = image_encoder or SimpleImageEncoder()
     refs = json.loads(Path(references_path).read_text(encoding="utf-8"))
@@ -489,14 +536,34 @@ def build_reference_indexes(
     if image_index.vectors.size > 0:
         image_index.save(out_dir_path / "image")
 
-    return {
+    result: Dict[str, Any] = {
         "text": "ok" if text_index.vectors.size > 0 else "empty",
         "image": "ok" if image_index.vectors.size > 0 else "empty",
         "out": str(out_dir_path),
     }
 
+    if chroma_dir:
+        chroma_store = build_chroma_from_references(
+            references_path=references_path,
+            persist_directory=chroma_dir,
+            collection_name=chroma_collection_name,
+            text_encoder=text_encoder,
+            image_encoder=image_encoder,
+        )
+        result["chroma"] = {
+            "persist_directory": chroma_dir,
+            "collection_name": chroma_collection_name,
+            "count": chroma_store.count,
+        }
 
-def load_indices(index_dir: str) -> Tuple[Optional[ReferenceIndex], Optional[ReferenceIndex]]:
+    return result
+
+
+def load_indices(
+    index_dir: str,
+    chroma_dir: Optional[str] = None,
+    chroma_collection_name: str = "references",
+) -> Tuple[Optional[ReferenceIndex], Optional[ReferenceIndex], Optional[ChromaReferenceStore]]:
     root = Path(index_dir)
     if not root.exists():
         raise FileNotFoundError(f"index directory not found: {index_dir}")
@@ -516,7 +583,11 @@ def load_indices(index_dir: str) -> Tuple[Optional[ReferenceIndex], Optional[Ref
     elif (root / "image_vectors.npy").exists() and (root / "image_metadata.jsonl").exists():
         image_index = ReferenceIndex.load(root)
 
-    return text_index, image_index
+    chroma_store: Optional[ChromaReferenceStore] = None
+    if chroma_dir:
+        chroma_store = ChromaReferenceStore(collection_name=chroma_collection_name, persist_directory=chroma_dir)
+
+    return text_index, image_index, chroma_store
 
 
 def detections_to_json(detections: Sequence[Detection]) -> Dict[str, Any]:
