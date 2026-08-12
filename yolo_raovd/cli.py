@@ -58,6 +58,13 @@ def cmd_detect(args: argparse.Namespace) -> int:
         config=cfg,
     )
 
+    metadata_filter: Optional[Dict[str, Any]] = None
+    if args.metadata_filter:
+        try:
+            metadata_filter = json.loads(args.metadata_filter)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid --metadata-filter JSON: {exc}") from exc
+
     queries: List[str] = []
     if args.queries:
         queries.extend([q.strip() for q in args.queries.split(",") if q.strip()])
@@ -82,6 +89,7 @@ def cmd_detect(args: argparse.Namespace) -> int:
                     top_k=args.top_k,
                     score_threshold=args.score_threshold,
                     nms_iou=args.nms_iou,
+                    metadata_filter=metadata_filter,
                 )
             )
     elif mode == "image":
@@ -95,6 +103,7 @@ def cmd_detect(args: argparse.Namespace) -> int:
                 score_threshold=args.score_threshold,
                 nms_iou=args.nms_iou,
                 query_image_agg=args.query_image_agg,
+                metadata_filter=metadata_filter,
             )
         )
     elif mode == "hybrid":
@@ -108,6 +117,7 @@ def cmd_detect(args: argparse.Namespace) -> int:
                     top_k=args.top_k,
                     score_threshold=args.score_threshold,
                     nms_iou=args.nms_iou,
+                    metadata_filter=metadata_filter,
                 )
             )
         if query_images:
@@ -119,6 +129,7 @@ def cmd_detect(args: argparse.Namespace) -> int:
                     score_threshold=args.score_threshold,
                     nms_iou=args.nms_iou,
                     query_image_agg=args.query_image_agg,
+                    metadata_filter=metadata_filter,
                 )
             )
     else:
@@ -308,6 +319,13 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
         config=cfg,
     )
 
+    metadata_filter: Optional[Dict[str, Any]] = None
+    if args.metadata_filter:
+        try:
+            metadata_filter = json.loads(args.metadata_filter)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid --metadata-filter JSON: {exc}") from exc
+
     if args.benchmark_mode == "image" and image_index is None:
         raise ValueError("image index is empty, run index with image modality references first")
     if args.benchmark_mode == "text" and text_index is None:
@@ -344,6 +362,7 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
                     top_k=cfg.top_k,
                     score_threshold=cfg.score_threshold,
                     nms_iou=cfg.nms_iou,
+                    metadata_filter=metadata_filter,
                 )
             else:
                 query_images = [_normalize_prompt_query_file(prompts_path, q) for q in queries]
@@ -444,6 +463,7 @@ def main() -> int:
     p_det.add_argument("--yolo-iou", type=float, default=0.45)
     p_det.add_argument("--yolo-max-det", type=int, default=300)
     p_det.add_argument("--chroma-dir", default=None)
+    p_det.add_argument("--metadata-filter", default=None)
     p_det.add_argument("--output", default="outputs/predictions.json")
     p_det.set_defaults(func=cmd_detect)
 
@@ -467,6 +487,7 @@ def main() -> int:
     p_bm.add_argument("--yolo-iou", type=float, default=0.45)
     p_bm.add_argument("--yolo-max-det", type=int, default=300)
     p_bm.add_argument("--chroma-dir", default=None)
+    p_bm.add_argument("--metadata-filter", default=None)
     p_bm.add_argument("--output", default="reports/coco.json")
     p_bm.set_defaults(func=cmd_benchmark)
 

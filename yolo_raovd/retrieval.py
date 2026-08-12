@@ -55,6 +55,7 @@ class ReferenceIndex:
         *,
         modality: Optional[str] = None,
         metadata_filter: Optional[Dict[str, Any]] = None,
+        candidate_ids: Optional[set] = None,
     ) -> List[int]:
         idxs: List[int] = []
         for i, item in enumerate(self.metadata):
@@ -70,6 +71,9 @@ class ReferenceIndex:
                         break
                 if not ok:
                     continue
+            if candidate_ids:
+                if str(item.get("id")) not in candidate_ids:
+                    continue
             idxs.append(i)
         return idxs
 
@@ -80,6 +84,7 @@ class ReferenceIndex:
         use_faiss: bool = True,
         modality: Optional[str] = None,
         metadata_filter: Optional[Dict[str, Any]] = None,
+        candidate_ids: Optional[set] = None,
     ) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
         if self.vectors.size == 0:
             return np.empty((0,), dtype=np.float32), []
@@ -88,7 +93,7 @@ class ReferenceIndex:
         if query.shape[1] != self.dim:
             raise ValueError("query dim mismatch")
 
-        candidates = self._select_candidates(modality=modality, metadata_filter=metadata_filter)
+        candidates = self._select_candidates(modality=modality, metadata_filter=metadata_filter, candidate_ids=candidate_ids)
         if not candidates:
             return np.empty((0,), dtype=np.float32), []
 

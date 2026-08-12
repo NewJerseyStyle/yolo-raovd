@@ -202,11 +202,11 @@ class YoloRaovdDetector:
         top_k: Optional[int] = None,
         score_threshold: Optional[float] = None,
         nms_iou: Optional[float] = None,
+        metadata_filter: Optional[Dict[str, Any]] = None,
     ) -> List[Detection]:
         if self.text_index is None or self.text_index.vectors.size == 0:
             raise ValueError("text index is empty, run index first")
         image = self._load_image_array(image_path)
-        h, w = image.shape[:2]
         proposals = self.proposer.propose(image, self.config.max_proposals)
         top_k = top_k if top_k is not None else self.config.top_k
         score_threshold = score_threshold if score_threshold is not None else self.config.score_threshold
@@ -226,6 +226,8 @@ class YoloRaovdDetector:
                 if label in query_labels:
                     query_label_boost[label] = max(query_label_boost.get(label, -1e9), float(s))
 
+            candidate_ids = {str(p.get("id")) for p in q_payloads if p.get("id")}
+
             if self.chroma_store is not None and proposals:
                 region_vectors = np.stack([self.text_image_encoder.encode(self._crop_region(image, box)) for box, _ in proposals])
                 all_scores, all_payloads = self._search_batch_text(region_vectors, top_k)
@@ -239,7 +241,11 @@ class YoloRaovdDetector:
                 else:
                     region = self._crop_region(image, box)
                     region_vector = self.text_image_encoder.encode(region)
-                    scores, payloads = self.text_index.search(region_vector, top_k=top_k)
+                    scores, payloads = self.text_index.search(
+                        region_vector,
+                        top_k=top_k,
+                        candidate_ids=candidate_ids or None,
+                    )
                 by_label: Dict[str, List[float]] = {}
                 topk_meta: Dict[str, List[Dict[str, Any]]] = {}
                 for s, p in zip(scores, payloads):
@@ -311,11 +317,11 @@ class YoloRaovdDetector:
         score_threshold: Optional[float] = None,
         nms_iou: Optional[float] = None,
         query_image_agg: str = "mean",
+        metadata_filter: Optional[Dict[str, Any]] = None,
     ) -> List[Detection]:
         if self.image_index is None or self.image_index.vectors.size == 0:
             raise ValueError("image index is empty, run index with image references first")
         image = self._load_image_array(image_path)
-        h, w = image.shape[:2]
         proposals = self.proposer.propose(image, self.config.max_proposals)
         top_k = top_k if top_k is not None else self.config.top_k
         score_threshold = score_threshold if score_threshold is not None else self.config.score_threshold
@@ -327,6 +333,7 @@ class YoloRaovdDetector:
         query_label_scores: Dict[str, List[float]] = {}
         query_label_counts: Dict[str, int] = {}
         query_labels = set()
+        candidate_ids = set()
         for qimg in query_images:
             q = str(qimg).strip()
             if not q:
@@ -340,6 +347,9 @@ class YoloRaovdDetector:
                 query_labels.add(label)
                 query_label_scores.setdefault(label, []).append(float(s))
                 query_label_counts[label] = query_label_counts.get(label, 0) + 1
+                ref_id = p.get("id")
+                if ref_id:
+                    candidate_ids.add(str(ref_id))
 
         if query_image_agg == "mean":
             query_label_boost: Dict[str, float] = {
@@ -356,7 +366,6 @@ class YoloRaovdDetector:
                 max_count = max(query_label_counts.values())
                 top_count_labels = [label for label, count in query_label_counts.items() if count == max_count]
                 if len(top_count_labels) > 1:
-                    # tie-break by average query-image retrieval quality for deterministic single choice
                     mean_scores = {
                         label: float(np.mean(query_label_scores.get(label, [0.0])))
                         for label in top_count_labels
@@ -386,7 +395,11 @@ class YoloRaovdDetector:
             else:
                 region = self._crop_region(image, box)
                 region_vector = self.image_encoder.encode(region)
-                scores, payloads = self.image_index.search(region_vector, top_k=top_k)
+                scores, payloads = self.image_index.search(
+                    region_vector,
+                    top_k=top_k,
+                    candidate_ids=candidate_ids or None,
+                )
             by_label: Dict[str, List[float]] = {}
             topk_meta: Dict[str, List[Dict[str, Any]]] = {}
             for s, p in zip(scores, payloads):
@@ -460,6 +473,7 @@ class YoloRaovdDetector:
         score_threshold: Optional[float] = None,
         nms_iou: Optional[float] = None,
         query_image_agg: str = "mean",
+        metadata_filter: Optional[Dict[str, Any]] = None,
     ) -> List[Detection]:
         return self.detect_with_image_queries(
             image_path=image_path,
@@ -468,6 +482,7 @@ class YoloRaovdDetector:
             score_threshold=score_threshold,
             nms_iou=nms_iou,
             query_image_agg=query_image_agg,
+            metadata_filter=metadata_filter,
         )
 
 def _resolve_ref_label(item: Dict[str, Any]) -> str:
