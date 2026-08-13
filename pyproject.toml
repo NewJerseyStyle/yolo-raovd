@@ -19,8 +19,12 @@ dependencies = [
   "torch",
   "torchvision",
   "transformers",
-  "ultralytics",
   "chromadb"
+]
+
+[project.optional-dependencies]
+coco = [
+  "ultralytics",
 ]
 
 [project.scripts]

@@ -381,11 +381,12 @@ class YoloRaovdDetector:
         if not query_label_boost:
             return []
 
-        if self.chroma_store is not None and proposals:
-            region_vectors = np.stack([self.image_encoder.encode(self._crop_region(image, box)) for box, _ in proposals])
+        all_scores = None
+        all_payloads = None
+        if proposals:
+            crops = [self._crop_region(image, box) for box, _ in proposals]
+            region_vectors = self.image_encoder.encode_batch(crops)
             all_scores, all_payloads = self._search_batch_image(region_vectors, top_k)
-        else:
-            all_scores, all_payloads = None, None
 
         results: List[Detection] = []
         for idx, (box, obj_score) in enumerate(proposals):
