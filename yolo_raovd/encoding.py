@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
@@ -91,7 +91,20 @@ class SimpleTextEncoder:
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         with np.errstate(all="ignore"):
             feats = self._resources["model"].get_text_features(**inputs)
-        return _normalize(_to_numpy(feats[0])).astype(np.float32)
+        if hasattr(feats, "pooler_output") and feats.pooler_output is not None:
+            feat = _to_numpy(feats.pooler_output)
+        elif hasattr(feats, "last_hidden_state") and feats.last_hidden_state is not None:
+            feat = _to_numpy(feats.last_hidden_state)
+            if feat.ndim == 3:
+                feat = feat[0]
+            feat = feat.mean(axis=0)
+        else:
+            feat = _to_numpy(feats)
+            if feat.ndim == 3:
+                feat = feat[0]
+            if feat.ndim > 1:
+                feat = feat[0]
+        return _normalize(feat.astype(np.float32)).astype(np.float32)
 
 
 @dataclass
@@ -134,9 +147,29 @@ class SimpleCLIPImageEncoder:
         self._load()
         img = _array_to_pil(image)
         inputs = self._resources["processor"](images=img, return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        feats = self._resources["model"].get_image_features(**inputs)
-        return _normalize(_to_numpy(feats[0])).astype(np.float32)
+        if hasattr(next(iter(inputs.values())), "to"):
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        with np.errstate(all="ignore"):
+            feats = self._resources["model"].get_image_features(**inputs)
+
+        if hasattr(feats, "pooler_output") and feats.pooler_output is not None:
+            feat = _to_numpy(feats.pooler_output)
+        elif hasattr(feats, "last_hidden_state") and feats.last_hidden_state is not None:
+            feat = _to_numpy(feats.last_hidden_state)
+            if feat.ndim == 3:
+                feat = feat[0]
+            if feat.ndim > 1:
+                feat = feat.mean(axis=0)
+        else:
+            feat = _to_numpy(feats)
+            if feat.ndim == 3:
+                feat = feat[0]
+            if feat.ndim > 1:
+                feat = feat.mean(axis=0)
+        vector = np.asarray(feat, dtype=np.float32)
+        if vector.ndim > 1:
+            vector = vector.reshape(-1)
+        return _normalize(vector).astype(np.float32)
 
     def encode_image(self, image_path: str) -> np.ndarray:
         return self.encode(_array_from_pil(image_path))
