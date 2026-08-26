@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import json
@@ -9,6 +9,7 @@ import numpy as np
 
 from .confidence import iou
 from .pipeline import YoloRaovdConfig, YoloRaovdDetector, build_reference_indexes, detections_to_json, load_indices
+from .pdf_stats import analyze_pdf, format_summary, summarize_results
 from .visualize import draw_predictions
 
 
@@ -23,22 +24,46 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_index(args: argparse.Namespace) -> int:
-    build_reference_indexes(
+    result = build_reference_indexes(
         references_path=args.references,
         out_dir=args.out,
+        chroma_dir=args.chroma_dir,
+        chroma_collection_name="references",
     )
     print(f"index built at: {args.out}")
+    if result.get("chroma"):
+        print(f"chroma collection ready: {result['chroma']}")
     return 0
 
 
 def cmd_detect(args: argparse.Namespace) -> int:
-    text_index, image_index = load_indices(args.index)
+    text_index, image_index, chroma_store = load_indices(
+        args.index,
+        chroma_dir=args.chroma_dir,
+        chroma_collection_name="references",
+    )
     cfg = YoloRaovdConfig(
         top_k=args.top_k,
         score_threshold=args.score_threshold,
         nms_iou=args.nms_iou,
+        yolo_model_path=args.yolo_model,
+        yolo_conf=args.yolo_conf,
+        yolo_iou=args.yolo_iou,
+        yolo_max_det=args.yolo_max_det,
     )
-    detector = YoloRaovdDetector(text_index=text_index, image_index=image_index, config=cfg)
+    detector = YoloRaovdDetector(
+        text_index=text_index,
+        image_index=image_index,
+        chroma_store=chroma_store,
+        config=cfg,
+    )
+
+    metadata_filter: Optional[Dict[str, Any]] = None
+    if args.metadata_filter:
+        try:
+            metadata_filter = json.loads(args.metadata_filter)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid --metadata-filter JSON: {exc}") from exc
 
     queries: List[str] = []
     if args.queries:
@@ -54,18 +79,22 @@ def cmd_detect(args: argparse.Namespace) -> int:
         raise ValueError("no query is provided")
 
     detections = []
-    for q in queries:
-        detections.extend(
-            detector.detect_with_text_queries(
-                image_path=args.image,
-                queries=[q],
-                top_k=args.top_k,
-                score_threshold=args.score_threshold,
-                nms_iou=args.nms_iou,
+    mode = str(args.query_mode).strip().lower()
+    if mode == "text":
+        for q in queries:
+            detections.extend(
+                detector.detect_with_text_queries(
+                    image_path=args.image,
+                    queries=[q],
+                    top_k=args.top_k,
+                    score_threshold=args.score_threshold,
+                    nms_iou=args.nms_iou,
+                    metadata_filter=metadata_filter,
+                )
             )
-        )
-
-    if query_images:
+    elif mode == "image":
+        if not query_images:
+            raise ValueError("image mode requires --query-image")
         detections.extend(
             detector.detect_with_image_queries(
                 image_path=args.image,
@@ -74,8 +103,37 @@ def cmd_detect(args: argparse.Namespace) -> int:
                 score_threshold=args.score_threshold,
                 nms_iou=args.nms_iou,
                 query_image_agg=args.query_image_agg,
+                metadata_filter=metadata_filter,
             )
         )
+    elif mode == "hybrid":
+        if not queries and not query_images:
+            raise ValueError("hybrid mode requires text or image queries")
+        if queries:
+            detections.extend(
+                detector.detect_with_text_queries(
+                    image_path=args.image,
+                    queries=queries,
+                    top_k=args.top_k,
+                    score_threshold=args.score_threshold,
+                    nms_iou=args.nms_iou,
+                    metadata_filter=metadata_filter,
+                )
+            )
+        if query_images:
+            detections.extend(
+                detector.detect_with_image_queries(
+                    image_path=args.image,
+                    query_images=query_images,
+                    top_k=args.top_k,
+                    score_threshold=args.score_threshold,
+                    nms_iou=args.nms_iou,
+                    query_image_agg=args.query_image_agg,
+                    metadata_filter=metadata_filter,
+                )
+            )
+    else:
+        raise ValueError("query mode must be one of: text, image, hybrid")
 
     payload = detections_to_json(detections)
     payload["image"] = args.image
@@ -240,13 +298,33 @@ def _load_benchmark_queries(prompts: object) -> Dict[str, List[str]]:
 
 
 def cmd_benchmark(args: argparse.Namespace) -> int:
-    text_index, image_index = load_indices(args.index)
+    text_index, image_index, chroma_store = load_indices(
+        args.index,
+        chroma_dir=args.chroma_dir,
+        chroma_collection_name="references",
+    )
     cfg = YoloRaovdConfig(
         top_k=args.top_k,
         score_threshold=args.score_threshold,
         nms_iou=0.5,
+        yolo_model_path=args.yolo_model,
+        yolo_conf=args.yolo_conf,
+        yolo_iou=args.yolo_iou,
+        yolo_max_det=args.yolo_max_det,
     )
-    detector = YoloRaovdDetector(text_index=text_index, image_index=image_index, config=cfg)
+    detector = YoloRaovdDetector(
+        text_index=text_index,
+        image_index=image_index,
+        chroma_store=chroma_store,
+        config=cfg,
+    )
+
+    metadata_filter: Optional[Dict[str, Any]] = None
+    if args.metadata_filter:
+        try:
+            metadata_filter = json.loads(args.metadata_filter)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid --metadata-filter JSON: {exc}") from exc
 
     if args.benchmark_mode == "image" and image_index is None:
         raise ValueError("image index is empty, run index with image modality references first")
@@ -284,6 +362,7 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
                     top_k=cfg.top_k,
                     score_threshold=cfg.score_threshold,
                     nms_iou=cfg.nms_iou,
+                    metadata_filter=metadata_filter,
                 )
             else:
                 query_images = [_normalize_prompt_query_file(prompts_path, q) for q in queries]
@@ -334,6 +413,26 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_pdf_stats(args: argparse.Namespace) -> int:
+    pdf_paths = [Path(p) for p in args.pdfs]
+    if args.batch:
+        pdf_paths = sorted(Path(args.batch).glob("*.pdf"))
+
+    if not pdf_paths:
+        raise ValueError("no PDF files were provided")
+
+    results = [analyze_pdf(path) for path in pdf_paths]
+    summary = summarize_results(results)
+
+    out = args.output or "outputs/pdf_stats.json"
+    _ensure_parent(out)
+    Path(out).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(format_summary(summary))
+    print(f"saved pdf stats: {out}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="yolo_raovd", description="YOLO-RAOVD MVP CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -345,6 +444,7 @@ def main() -> int:
     p_idx = sub.add_parser("index")
     p_idx.add_argument("--references", required=True)
     p_idx.add_argument("--out", required=True)
+    p_idx.add_argument("--chroma-dir", default=None)
     p_idx.set_defaults(func=cmd_index)
 
     p_det = sub.add_parser("detect")
@@ -352,11 +452,18 @@ def main() -> int:
     p_det.add_argument("--index", required=True)
     p_det.add_argument("--query", action="append")
     p_det.add_argument("--query-image", action="append")
+    p_det.add_argument("--query-mode", choices=["text", "image", "hybrid"], default="text")
     p_det.add_argument("--queries")
     p_det.add_argument("--top-k", type=int, default=20)
     p_det.add_argument("--score-threshold", type=float, default=0.15)
     p_det.add_argument("--nms-iou", type=float, default=0.5)
     p_det.add_argument("--query-image-agg", choices=["mean", "max", "mode"], default="mean")
+    p_det.add_argument("--yolo-model", default=None)
+    p_det.add_argument("--yolo-conf", type=float, default=0.25)
+    p_det.add_argument("--yolo-iou", type=float, default=0.45)
+    p_det.add_argument("--yolo-max-det", type=int, default=300)
+    p_det.add_argument("--chroma-dir", default=None)
+    p_det.add_argument("--metadata-filter", default=None)
     p_det.add_argument("--output", default="outputs/predictions.json")
     p_det.set_defaults(func=cmd_detect)
 
@@ -375,8 +482,20 @@ def main() -> int:
     p_bm.add_argument("--top-k", type=int, default=20)
     p_bm.add_argument("--score-threshold", type=float, default=0.15)
     p_bm.add_argument("--query-image-agg", choices=["mean", "max", "mode"], default="mean")
+    p_bm.add_argument("--yolo-model", default=None)
+    p_bm.add_argument("--yolo-conf", type=float, default=0.25)
+    p_bm.add_argument("--yolo-iou", type=float, default=0.45)
+    p_bm.add_argument("--yolo-max-det", type=int, default=300)
+    p_bm.add_argument("--chroma-dir", default=None)
+    p_bm.add_argument("--metadata-filter", default=None)
     p_bm.add_argument("--output", default="reports/coco.json")
     p_bm.set_defaults(func=cmd_benchmark)
+
+    p_pdf = sub.add_parser("pdf-stats")
+    p_pdf.add_argument("--pdfs", nargs="+", required=True)
+    p_pdf.add_argument("--batch", default=None)
+    p_pdf.add_argument("--output", default="outputs/pdf_stats.json")
+    p_pdf.set_defaults(func=cmd_pdf_stats)
 
     args = parser.parse_args()
     return args.func(args)

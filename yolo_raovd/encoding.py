@@ -179,7 +179,7 @@ class SimpleCLIPImageEncoder:
 class SimpleImageEncoder:
     """DINOv3 image encoder used for region embeddings and image-query matching."""
 
-    model_name: str = "facebook/dinov3-vits16plus-pretrain-lvd1689m"
+    model_name: str = "facebook/dinov2-base"
     fallback_model_names: Optional[List[str]] = None
     device: str = "cpu"
     _resources: Dict[str, Any] = field(default_factory=dict, init=False, repr=False)
@@ -241,12 +241,35 @@ class SimpleImageEncoder:
                 feat = hidden[:, 1:].mean(axis=1)
         return _normalize(_to_numpy(feat[0]))
 
+    def _extract_feature_batch(self, pixel_values) -> np.ndarray:
+        outputs = self._resources["model"](pixel_values=pixel_values)
+        if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+            feat = outputs.pooler_output
+        else:
+            hidden = outputs.last_hidden_state
+            if hidden.ndim != 3 or hidden.shape[1] <= 1:
+                feat = hidden[:, 0]
+            else:
+                feat = hidden[:, 1:].mean(axis=1)
+        vectors = _to_numpy(feat)
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-8
+        return (vectors / norms).astype(np.float32)
+
     def encode(self, image: np.ndarray) -> np.ndarray:
         self._load()
         img = _array_to_pil(image)
         inputs = self._resources["processor"](images=img, return_tensors="pt")
         pixel_values = inputs["pixel_values"].to(self.device)
         return self._extract_feature(pixel_values)
+
+    def encode_batch(self, images: List[np.ndarray]) -> np.ndarray:
+        self._load()
+        if not images:
+            return np.empty((0, self.dim), dtype=np.float32)
+        imgs = [_array_to_pil(img) for img in images]
+        inputs = self._resources["processor"](images=imgs, return_tensors="pt")
+        pixel_values = inputs["pixel_values"].to(self.device)
+        return self._extract_feature_batch(pixel_values)
 
     def encode_image(self, image_path: str) -> np.ndarray:
         return self.encode(_array_from_pil(image_path))

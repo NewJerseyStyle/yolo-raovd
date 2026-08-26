@@ -18,7 +18,13 @@ dependencies = [
   "faiss-cpu",
   "torch",
   "torchvision",
-  "transformers"
+  "transformers",
+  "chromadb"
+]
+
+[project.optional-dependencies]
+coco = [
+  "ultralytics",
 ]
 
 [project.scripts]
