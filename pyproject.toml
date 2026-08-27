@@ -3,9 +3,9 @@ requires = ["hatchling>=1.21"]
 build-backend = "hatchling.build"
 
 [project]
-name = "yolo-raovd"
+name = "raod"
 version = "0.1.0"
-description = "YOLO-RAOVD: zero-shot open-vocabulary object detection using region proposals + retrieval"
+description = "RAOD: zero-shot open-vocabulary object detection using dense feature matching + retrieval"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
@@ -15,20 +15,21 @@ authors = [
 dependencies = [
   "numpy",
   "Pillow",
-  "faiss-cpu",
+  "ftfy",
+  "regex",
   "torch",
   "torchvision",
   "transformers",
-  "chromadb"
+  "chromadb",
+  "segment-anything",
+  "hdbscan"
 ]
 
 [project.optional-dependencies]
-coco = [
-  "ultralytics",
-]
+coco = []
 
 [project.scripts]
-yolo-raovd = "yolo_raovd.cli:main"
+raod = "raod.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["yolo_raovd"]
+packages = ["raod"]

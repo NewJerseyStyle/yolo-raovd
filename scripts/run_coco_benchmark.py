@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import random
 import time
 from pathlib import Path
@@ -17,14 +16,26 @@ IOU_THRESHOLD = 0.5
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="COCO benchmark for YOLO-RAOVD")
+    p = argparse.ArgumentParser(description="COCO benchmark for RAOD dense matching")
     p.add_argument("--data-dir", type=str, default=None, help="Path to COCO dataset root (default: datasets/coco)")
     p.add_argument("--sample-size", type=int, default=1000, help="Number of images to sample (default: 1000)")
     p.add_argument("--full", action="store_true", help="Use full validation set instead of sampling")
     p.add_argument("--seed", type=int, default=42, help="Random seed for sampling (default: 42)")
     p.add_argument("--output", type=str, default=str(REPORTS_DIR / "coco_benchmark.json"), help="Output JSON path")
     p.add_argument("--index-dir", type=str, default=str(REPORTS_DIR / "coco_index"), help="Reference index directory")
+    p.add_argument("--store-dir", type=str, default=str(REPORTS_DIR / "coco_chroma"), help="Chroma store directory")
     p.add_argument("--refs-path", type=str, default=str(REPORTS_DIR / "coco_references.json"), help="References JSON path")
+    p.add_argument("--backbone-weights", type=str, default=None, help="Path/URL to DINOv3 backbone weights")
+    p.add_argument("--dinotxt-weights", type=str, default=None, help="Path/URL to dino.txt text encoder + vision head weights")
+    p.add_argument("--bpe-path", type=str, default=None, help="Path/URL to the BPE vocabulary for the text tokenizer")
+    p.add_argument("--device", type=str, default="cpu")
+    p.add_argument("--tile-size", type=int, default=1024)
+    p.add_argument("--tiles-per-axis", type=int, default=None)
+    p.add_argument("--overlap-ratio", type=float, default=0.15)
+    p.add_argument("--similarity-threshold", type=float, default=0.30)
+    p.add_argument("--dbscan-eps", type=float, default=1.5)
+    p.add_argument("--dbscan-min-samples", type=int, default=3)
+    p.add_argument("--top-k", type=int, default=5)
     return p.parse_args()
 
 
@@ -210,7 +221,6 @@ def main() -> None:
     coco_dir = resolve_coco_dir(args)
     print(f"Using COCO dataset at: {coco_dir}")
     images_dir = coco_dir / "images"
-    labels_dir = coco_dir / "labels"
     ann_file = coco_dir / "annotations" / "instances_val2017_filtered.json"
     if not ann_file.exists():
         ann_file = coco_dir / "annotations" / "instances_val2017.json"
@@ -237,29 +247,43 @@ def main() -> None:
     with open(refs_path, "w", encoding="utf-8") as f:
         json.dump(refs, f, indent=2)
 
-    from yolo_raovd.pipeline import YoloRaovdDetector, YoloRaovdConfig, build_reference_indexes, load_indices
+    from raod.dense import DenseMatcher
+    from raod.encoding import DINOV3Encoder
+    from raod.retrieval import build_reference_indexes
 
     index_dir = Path(args.index_dir)
-    index_exists = (index_dir / "image" / "vectors.npy").exists() or (index_dir / "image_vectors.npy").exists()
+    store_dir = Path(args.store_dir)
+    encoder_kwargs = {"device": args.device}
+    if args.backbone_weights:
+        encoder_kwargs["backbone_weights"] = args.backbone_weights
+    if args.dinotxt_weights:
+        encoder_kwargs["dinotxt_weights"] = args.dinotxt_weights
+    if args.bpe_path:
+        encoder_kwargs["bpe_path_or_url"] = args.bpe_path
+    encoder = DINOV3Encoder(**encoder_kwargs)
+
+    index_exists = (store_dir / "chroma.sqlite3").exists()
     if not index_exists:
         print("Building reference index...")
-        build_reference_indexes(str(refs_path), str(index_dir))
+        build_reference_indexes(str(refs_path), str(index_dir), encoder=encoder, chroma_dir=str(store_dir))
     else:
         print(f"Reusing existing reference index at {index_dir}")
 
-    _, image_index, _ = load_indices(str(index_dir))
-    config = YoloRaovdConfig(
-        top_k=5,
-        score_threshold=0.15,
-        nms_iou=0.5,
-        yolo_conf=0.25,
-        yolo_iou=0.45,
-        yolo_max_det=300,
-        max_proposals=50,
-    )
-    detector = YoloRaovdDetector(image_index=image_index, config=config)
+    from raod.retrieval import ChromaReferenceStore
 
-    print(f"Running detection on {len(sampled)} images...")
+    store = ChromaReferenceStore(collection_name="references", persist_directory=str(store_dir))
+    matcher = DenseMatcher(
+        encoder=encoder,
+        tile_size=args.tile_size,
+        tiles_per_axis=args.tiles_per_axis,
+        overlap_ratio=args.overlap_ratio,
+        similarity_threshold=args.similarity_threshold,
+        dbscan_eps=args.dbscan_eps,
+        dbscan_min_samples=args.dbscan_min_samples,
+        device=args.device,
+    )
+
+    print(f"Running dense matching on {len(sampled)} images...")
     all_preds = []
     times = []
     checkpoint_path = Path(args.output).with_suffix('.checkpoint.json')
@@ -284,27 +308,23 @@ def main() -> None:
             images_dir / "test2017" / fname,
         ]
         img_path = next((p for p in candidates if p.exists()), images_dir / fname)
+        from PIL import Image
+
+        image = np.array(Image.open(img_path).convert("RGB"))
         t0 = time.perf_counter()
         try:
-            dets = detector.detect_with_image_queries(
-                image_path=img_path,
-                query_images=[r["image"] for r in refs],
-                top_k=5,
-                score_threshold=0.15,
-                nms_iou=0.5,
-                query_image_agg="mean",
-            )
+            boxes = matcher.match_reference_store(image, store, modality="image", top_k=args.top_k)
         except Exception as e:
             print(f"Error on {fname}: {e}")
             continue
         t1 = time.perf_counter()
         times.append(t1 - t0)
-        for d in dets:
+        for box, score, label in boxes:
             all_preds.append({
                 "image_id": img_id,
-                "label": d.label,
-                "box": d.box,
-                "score": d.confidence,
+                "label": label,
+                "box": box,
+                "score": score,
             })
         checkpoint_path.write_text(
             json.dumps({"preds": all_preds, "times": times}, ensure_ascii=False),
@@ -331,6 +351,7 @@ def main() -> None:
         "fps": float(1.0 / np.mean(times)) if times else 0.0,
         "iou_threshold": IOU_THRESHOLD,
         "seed": args.seed,
+        "backbone": "dinov3_vitl16",
     }
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
