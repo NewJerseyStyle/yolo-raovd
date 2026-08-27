@@ -1,21 +1,15 @@
-# RAOD: Object Detection by Region Proposals + Vector Retrieval
+# RAOD: Object Detection by Dense Feature Matching + Vector Retrieval
 
-Retrieval Augmented Open Object Detection (RAOD) is an experimental framework for open-vocabulary object detection with region proposals and retrieval-based matching against both text and image prompts.
+Retrieval Augmented Open Object Detection (RAOD) is an experimental framework for open-vocabulary object detection. Instead of a closed-set region-proposal detector (e.g. YOLO), it tiles the input image, embeds each tile with a unified DINOv3 / dino.txt encoder, and matches the resulting spatial features against query embeddings or a ChromaDB reference store to produce bounding boxes.
 
 ## Features
 
-- Text or image query input (image query supports multiple reference images per label)
-- Top-k retrieval-based evidence for each region
-- Confidence score generation from top-k evidence
-- Optional box visualization
-- COCO benchmark script skeleton
-
-## What is implemented now
-
-- `yolo_raovd` package with CLI entrypoint
-- Text/image reference indexing
-- Detection pipeline (MVP: region proposals + encoder models)
-- Drawing and evaluation entrypoints
+- Unified multimodal encoder: images via DINOv3 ViT-L + vision head, text via dino.txt text encoder, both projected into a shared 2048-dim space
+- Text-query or image-query matching
+- Reference store built from text and/or image samples (ChromaDB only)
+- Dense tiling (auto-pads to a multiple of 16) + HDBSCAN clustering into bounding boxes
+- Optional SAM point-prompt refinement of cluster centers into precise masks/boxes
+- COCO-style benchmark for evaluating detection performance (AP / AR)
 
 ## Install
 
@@ -26,22 +20,29 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-Before running DINOv3-based features, sign in to Hugging Face and accept the model usage agreement:
+### Model weights
+
+The DINOv3 / dino.txt checkpoints are large (several GB) and are not shipped with the package. Download them and point the encoder at them via environment variables or CLI flags:
+
+| Variable | Default | Contents |
+| --- | --- | --- |
+| `RAOD_BACKBONE_WEIGHTS` | `C:/tmp/dinov3_vitl16_backbone.pth` | DINOv3 ViT-L backbone (1.13 GB) |
+| `RAOD_DINOTXT_WEIGHTS` | `C:/tmp/dinov3_vitl16_dinotxt.pth` | dino.txt text encoder + vision head (2.25 GB) |
+| `RAOD_BPE_PATH` | `https://dl.fbaipublicfiles.com/dinov3/thirdparty/bpe_simple_vocab_16e6.txt.gz` | BPE vocab for the text tokenizer |
+
+The official `dl.fbaipublicfiles.com/dinov3/*` weight URLs are gated (403). Use the Hugging Face mirrors:
 
 ```bash
-huggingface-cli login
+# backbone
+https://huggingface.co/PIA-SPACE-LAB/dinov3_vitl16_dinotxt_vision_head_and_text_encoder/resolve/main/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth
+# text encoder + vision head
+https://huggingface.co/PIA-SPACE-LAB/dinov3_vitl16_dinotxt_vision_head_and_text_encoder/resolve/main/dinov3_vitl16_dinotxt_vision_head_and_text_encoder-a442d8f5.pth
 ```
-
-Then open the DINO model pages and agree to the license terms:
-
-- https://huggingface.co/facebook/dinov3-vits16plus-pretrain-lvd1689m
-- https://huggingface.co/facebook/dinov3-vit7b16-pretrain-lvd1689m
-- https://huggingface.co/facebook/dinov2-base (fallback)
 
 After installation:
 
 ```bash
-yolo-raovd --help
+raod --help
 ```
 
 ## File layout
@@ -49,149 +50,111 @@ yolo-raovd --help
 ```
 .
 +-- README.md
-+-- design.md
 +-- requirements.txt
 +-- pyproject.toml
-+-- yolo_raovd/
++-- raod/
 ¦   +-- __init__.py
 ¦   +-- cli.py
-¦   +-- confidence.py
+¦   +-- config.py
+¦   +-- dense.py
 ¦   +-- encoding.py
-¦   +-- pipeline.py
-¦   +-- proposal.py
 ¦   +-- retrieval.py
-¦   +-- types.py
 ¦   +-- visualize.py
+¦   +-- _vendor/
+¦       +-- dinov3/          # vendored DINOv3 + dino.txt package
++-- scripts/
+    +-- run_coco_benchmark.py
 +-- examples/
     +-- references_text.json
 ```
 
 ## Quick run
 
-1) Build text references index
+1) Build the ChromaDB reference store. Text rows are embedded with dino.txt, image rows with DINOv3, into the same 2048-dim space:
 
 ```bash
-python -m yolo_raovd.cli index \
+python -m raod index \
   --references examples/references_text.json \
-  --out ./.yolo_raovd_index
+  --out ./.raod_index \
+  --chroma-dir ./.raod_chroma
 ```
 
-2) Detect with text query
+2) Detect with a text query:
 
 ```bash
-python -m yolo_raovd.cli detect \
+python -m raod dense \
   --image /path/to/image.jpg \
-  --index ./.yolo_raovd_index \
-  --query "red cup" \
-  --query "blue bottle" \
-  --top-k 20 \
-  --score-threshold 0.20 \
-  --output outputs/predictions.json
+  --query "a red cup" \
+  --tile-size 1024 \
+  --similarity-threshold 0.30 \
+  --output outputs/dense.json
 ```
 
-3) Detect with image query
+3) Detect with an image query:
 
 ```bash
-python -m yolo_raovd.cli detect \
+python -m raod dense \
   --image /path/to/image.jpg \
-  --index ./.yolo_raovd_index \
   --query-image /path/to/query_object.jpg \
-  --top-k 20 \
-  --score-threshold 0.20 \
-  --query-image-agg max \
-  --output outputs/predictions_by_image.json
+  --output outputs/dense.json
 ```
 
-4) Draw boxes
+4) Detect against the reference store (per-label boxes):
 
 ```bash
-python -m yolo_raovd.cli draw \
+python -m raod dense \
   --image /path/to/image.jpg \
-  --predictions outputs/predictions.json \
+  --store ./.raod_chroma \
+  --index ./.raod_index \
+  --output outputs/dense.json
+```
+
+5) Draw boxes:
+
+```bash
+python -m raod draw \
+  --image /path/to/image.jpg \
+  --predictions outputs/dense.json \
   --output outputs/sample_vis.jpg
 ```
 
-5) Benchmark (text query)
+## Benchmark
+
+Evaluate dense matching against COCO-style annotations (AP / AR at IoU 0.5). The reference store supplies both the class (via top-k retrieval) and the bounding box:
 
 ```bash
-python -m yolo_raovd.cli benchmark \
-  --index ./.yolo_raovd_index \
+python -m raod benchmark \
+  --index ./.raod_index \
+  --store ./.raod_chroma \
   --annotations /path/to/instances_val2017.json \
   --images /path/to/val2017 \
-  --prompts examples/references_text.json \
-  --benchmark-mode text \
-  --output reports/coco_text.json
+  --output reports/dense_coco.json
 ```
 
-6) Benchmark (image query)
+There is also a standalone script that builds a reference index from COCO samples, runs dense matching over a sampled validation set, and reports AP / AR / FPS:
 
 ```bash
-python -m yolo_raovd.cli benchmark \
-  --index ./.yolo_raovd_index \
-  --annotations /path/to/instances_val2017.json \
-  --images /path/to/val2017 \
-  --prompts examples/references_image.json \
-  --benchmark-mode image \
-  --output reports/coco_image.json
+python scripts/run_coco_benchmark.py \
+  --data-dir /path/to/coco \
+  --sample-size 1000 \
+  --output reports/coco_benchmark.json
 ```
 
-For image-query benchmark, each label can provide one or more example images. The `--query-image-agg` option controls how multiple query images are merged.
+## Dense feature matching
 
-- `mean` (default): average retrieval scores per label.
-- `max`: use maximum retrieval score per label.
-- `mode`: pick the single most frequent label across all query top-k retrieval results (majority vote).
+The image is split into overlapping tiles. If the image (or a tile) is not a multiple of 16 pixels, it is auto-padded (edge replication) so the backbone's patch grid aligns cleanly. Each tile is embedded with the unified DINOv3 encoder to produce per-patch 2048-dim features, which are matched against a query to build a similarity heatmap. High-confidence locations are clustered with HDBSCAN into regions and bounding boxes.
 
-```bash
-python -m yolo_raovd.cli benchmark \
-  --index ./.yolo_raovd_index \
-  --annotations /path/to/instances_val2017.json \
-  --images /path/to/val2017 \
-  --prompts examples/references_image.json \
-  --benchmark-mode image \
-  --query-image-agg mode \
-  --output reports/coco_image.json
-```
+Options:
 
-The query format can be:
-
-```json
-{
-  "person": [
-    "examples/query_images/person_front.jpg",
-    "examples/query_images/person_side.jpg"
-  ],
-  "bicycle": ["examples/query_images/bicycle_1.jpg"]
-}
-```
-
-`prompts` can also be a JSON array. For each label, each entry may include `query`, `text`, `prompt`, `path`, or `image`:
-
-```json
-[
-  { "label": "person", "image": "examples/query_images/person_front.jpg" },
-  { "label": "person", "image": "examples/query_images/person_side.jpg" },
-  { "label": "bicycle", "path": "examples/query_images/bicycle_1.jpg" }
-]
-```
-
-`--benchmark-mode text` still accepts the existing text format.
+- `--tile-size` or `--tiles-per-axis`: control tile size (pixels) or the number of tiles per axis. Either can be used to target large or small objects.
+- `--backbone-weights`, `--dinotxt-weights`, `--bpe-path`: override the encoder weight paths (defaults come from `config.py` / environment variables).
+- `--overlap-ratio`: overlap between adjacent tiles (default 0.15).
+- `--similarity-threshold`, `--dbscan-eps`, `--dbscan-min-samples`: heatmap threshold and HDBSCAN clustering parameters.
+- `--validate`: optionally refine self-matched regions. Each region's center point is fed to SAM to build a bounding box; if SAM cannot produce a box, the region is dropped. When a `--store` is available, the SAM bbox region is also embedded and queried against ChromaDB, and dropped if no similar object is found (below `--chroma-threshold`).
 
 ## Design notes
 
+- The reference store must be built with the same encoder used for matching so the embedding spaces align (the `index` command uses the same DINOv3/dino.txt encoder by default).
 - `top-k` results are treated as retrieval evidence, not direct probabilities.
-- `detection score` = retrieval aggregation result
-- `confidence` = calibrated confidence-like score in `[0,1]` (sigmoid from weighted retrieval term + margin + consistency + objectness)
-- default aggregation methods in `confidence.py`:
-  - `weighted_mean`
-  - `max`
-  - `mean`
-  - `lse`
-
-## Runtime dependencies for model loading
-
-```bash
-pip install torch torchvision transformers
-```
-
-- If your workflow uses `--query-image`, DINOv3 is used for image embedding.
-- If your workflow uses `--query`, CLIP image embeddings are used for region matching.
+- `score` is the cosine similarity of the best matching reference for a cluster.
+- SAM is optional and only used to improve segmentation / bounding-box quality; it is not required for validation.

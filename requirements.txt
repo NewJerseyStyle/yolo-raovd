@@ -1,6 +1,10 @@
-﻿numpy
+numpy
 Pillow
-faiss-cpu
+ftfy
+regex
 torch
 torchvision
 transformers
+chromadb
+segment-anything
+hdbscan
