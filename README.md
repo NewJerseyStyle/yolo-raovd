@@ -1,6 +1,6 @@
-﻿# YOLO-RAOVD: Zero-Shot Detection by Region Proposals + Vector Retrieval
+# RAOD: Object Detection by Region Proposals + Vector Retrieval
 
-YOLO-RAOVD is an experimental framework for open-vocabulary object detection with region proposals and retrieval-based matching.
+Retrieval Augmented Open Object Detection (RAOD) is an experimental framework for open-vocabulary object detection with region proposals and retrieval-based matching against both text and image prompts.
 
 ## Features
 
